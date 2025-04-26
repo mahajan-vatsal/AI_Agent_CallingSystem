@@ -5,6 +5,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from datetime import datetime, timedelta
 
 # OAuth 2.0 scope for full calendar access
 SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -67,3 +69,92 @@ def create_event(start_time, end_time, summary, patient_email):
 
     event_result = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return event_result.get('htmlLink')
+    
+def is_slot_available(date, time):
+    # Assuming datetime format: YYYY-MM-DD, HH:MM
+    start = f"{date}T{time}:00"
+    end_dt = datetime.datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M") + datetime.timedelta(minutes=20)
+    end = end_dt.isoformat()
+
+    service = get_calendar_service()
+    events_result = service.events().list(
+        calendarId='primary',
+        timeMin=start,
+        timeMax=end,
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute()
+    events = events_result.get('items', [])
+    return len(events) == 0  # True if no conflicts
+
+
+def is_valid_appointment(date_str, time_str):
+    try:
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        weekday = dt.weekday()  # Monday = 0, Sunday = 6
+        hour = dt.hour
+
+        if weekday == 6:
+            return False, "Sunday"
+        elif 14 <= hour < 16:
+            return False, "Lunch Break"
+        elif 10 <= hour < 14 or 15 <= hour < 19:
+            return True, None
+        else:
+            return False, "Outside Hours"
+    except Exception:
+        return False, "Invalid Format"
+
+def find_and_cancel_appointment(email):
+    from googleapiclient.discovery import build
+    from google.oauth2.service_account import Credentials
+
+    SCOPES = ["https://www.googleapis.com/auth/calendar"]
+    creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    service = build("calendar", "v3", credentials=creds)
+
+    events_result = service.events().list(
+        calendarId="primary",
+        q=email,
+        maxResults=10,
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute()
+    events = events_result.get("items", [])
+
+    for event in events:
+        if email in event.get("description", ""):
+            service.events().delete(calendarId="primary", eventId=event["id"]).execute()
+            return True
+    return False
+
+
+
+SERVICE_ACCOUNT_FILE = 'credentials.json'  # Your credentials file
+
+credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+service = build('calendar', 'v3', credentials=credentials)
+
+def find_upcoming_appointment_by_email(email):
+    now = datetime.utcnow().isoformat() + 'Z'
+    events_result = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=now,
+        maxResults=10,
+        singleEvents=True,
+        orderBy='startTime',
+        q=email
+    ).execute()
+    events = events_result.get('items', [])
+    if events:
+        return events[0]  # Assume the first match is the one to cancel
+    return None
+
+def cancel_event(event_id):
+    try:
+        service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        return True
+    except Exception as e:
+        print("Error canceling event:", e)
+        return False
