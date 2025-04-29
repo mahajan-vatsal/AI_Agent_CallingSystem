@@ -1,28 +1,33 @@
 from __future__ import print_function
-import datetime
-import os.path
+import os
+from datetime import datetime, timedelta
+import pytz
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from datetime import datetime, timedelta
 
-# OAuth 2.0 scope for full calendar access
+# Constants
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-
-# Path to your token and credentials
 TOKEN_FILE = 'token.json'
-CREDENTIALS_FILE = 'credentials.json'
-
-# Doctor's calendar ID
+CREDENTIALS_FILE = 'agentic-ai-caller.json'
+SERVICE_ACCOUNT_FILE = 'agentic-ai-caller.json'
 CALENDAR_ID = 'primary'
+TIMEZONE = 'Asia/Kolkata'
 
-def get_calendar_service():
-    """Returns an authenticated Google Calendar service using OAuth 2.0."""
+# Initialize Service Account
+service_account_credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES
+)
+
+# Initialize OAuth 2.0 (user-based) credentials
+def init_oauth_service():
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    # If no valid creds, ask user to login
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -31,31 +36,31 @@ def get_calendar_service():
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, 'w') as token:
             token.write(creds.to_json())
+    service = build('calendar', 'v3', credentials=creds)
+    return service
 
-    return build('calendar', 'v3', credentials=creds)
+# Create global services once
+service_oauth = init_oauth_service()
+service_account_service = build('calendar', 'v3', credentials=service_account_credentials)
 
 def get_slot_datetime(date_str, time_str, duration_minutes=20):
     """
-    Returns start and end datetime strings in ISO 8601 format for the given slot.
-    Example: get_slot_datetime("2025-04-25", "10:20")
+    Returns start and end datetime strings in ISO 8601 format with timezone.
     """
-    start_dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+    local_tz = pytz.timezone(TIMEZONE)
+    start_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    start_dt = local_tz.localize(start_dt)
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
     return start_dt.isoformat(), end_dt.isoformat()
 
 def create_event(start_time, end_time, summary, patient_email):
-    """
-    Creates a calendar event and invites the doctor and patient via email.
-    Returns the event link.
-    """
-    service = get_calendar_service()
-
     event = {
         'summary': summary,
-        'description': 'Doctor Appointment via AI Agent',
+        'location': 'Clinic Address Here',  # Optional: you can customize this
+        'description': 'Doctor Appointment Booking via AI Agent.',  # You can customize
         'start': {
             'dateTime': start_time,
-            'timeZone': 'Asia/Kolkata',
+            'timeZone': 'Asia/Kolkata',  # Change if needed
         },
         'end': {
             'dateTime': end_time,
@@ -63,82 +68,69 @@ def create_event(start_time, end_time, summary, patient_email):
         },
         'attendees': [
             {'email': patient_email},
-            {'email': 'vatsalmahajan0007@gmail.com'},
+            {'email': 'vatsalmahajan0007@gmail.com'},  # Doctor's email (fixed)
         ],
+        'reminders': {
+            'useDefault': False,
+            'overrides': [
+                {'method': 'email', 'minutes': 24 * 60},  # 1 day before
+                {'method': 'popup', 'minutes': 10},       # 10 minutes before
+            ],
+        },
     }
-
-    event_result = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-    return event_result.get('htmlLink')
     
-def is_slot_available(date, time):
-    # Assuming datetime format: YYYY-MM-DD, HH:MM
-    start = f"{date}T{time}:00"
-    end_dt = datetime.datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M") + datetime.timedelta(minutes=20)
-    end = end_dt.isoformat()
+    event = service_oauth.events().insert(calendarId='primary', body=event, sendUpdates='all').execute()
+    print('✅ Event created:', event.get('htmlLink'))
+    return event
 
-    service = get_calendar_service()
-    events_result = service.events().list(
-        calendarId='primary',
-        timeMin=start,
-        timeMax=end,
+
+
+
+def is_slot_available(date_str, time_str, duration_minutes=20):
+    """
+    Checks if a time slot is free.
+    """
+    local_tz = pytz.timezone(TIMEZONE)
+    start_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    start_dt = local_tz.localize(start_dt)
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+
+    events_result = service_oauth.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=start_dt.isoformat(),
+        timeMax=end_dt.isoformat(),
         singleEvents=True,
         orderBy='startTime'
     ).execute()
     events = events_result.get('items', [])
-    return len(events) == 0  # True if no conflicts
-
+    return len(events) == 0
 
 def is_valid_appointment(date_str, time_str):
+    """
+    Validates appointment within business hours.
+    """
     try:
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        weekday = dt.weekday()  # Monday = 0, Sunday = 6
+        weekday = dt.weekday()
         hour = dt.hour
 
         if weekday == 6:
             return False, "Sunday"
         elif 14 <= hour < 16:
             return False, "Lunch Break"
-        elif 10 <= hour < 14 or 15 <= hour < 19:
+        elif (10 <= hour < 14) or (16 <= hour < 19):
             return True, None
         else:
             return False, "Outside Hours"
     except Exception:
         return False, "Invalid Format"
 
-def find_and_cancel_appointment(email):
-    from googleapiclient.discovery import build
-    from google.oauth2.service_account import Credentials
-
-    SCOPES = ["https://www.googleapis.com/auth/calendar"]
-    creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-    service = build("calendar", "v3", credentials=creds)
-
-    events_result = service.events().list(
-        calendarId="primary",
-        q=email,
-        maxResults=10,
-        singleEvents=True,
-        orderBy="startTime"
-    ).execute()
-    events = events_result.get("items", [])
-
-    for event in events:
-        if email in event.get("description", ""):
-            service.events().delete(calendarId="primary", eventId=event["id"]).execute()
-            return True
-    return False
-
-
-
-SERVICE_ACCOUNT_FILE = 'credentials.json'  # Your credentials file
-
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-service = build('calendar', 'v3', credentials=credentials)
-
 def find_upcoming_appointment_by_email(email):
+    """
+    Finds the next upcoming appointment by email.
+    """
     now = datetime.utcnow().isoformat() + 'Z'
-    events_result = service.events().list(
+    events_result = service_account_service.events().list(
         calendarId=CALENDAR_ID,
         timeMin=now,
         maxResults=10,
@@ -147,14 +139,15 @@ def find_upcoming_appointment_by_email(email):
         q=email
     ).execute()
     events = events_result.get('items', [])
-    if events:
-        return events[0]  # Assume the first match is the one to cancel
-    return None
+    return events[0] if events else None
 
 def cancel_event(event_id):
+    """
+    Cancels an existing event.
+    """
     try:
-        service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        service_account_service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
         return True
     except Exception as e:
-        print("Error canceling event:", e)
+        print(f"Error canceling event: {e}")
         return False

@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
-from calendar_utils import create_event, get_slot_datetime, is_valid_appointment, find_upcoming_appointment_by_email, cancel_event
+from calendar_utils import create_event, get_slot_datetime, is_valid_appointment, find_upcoming_appointment_by_email, cancel_event, is_slot_available
 from email_utils import send_email
 from speech_utils import transcribe_audio, text_to_speech
 from datetime import datetime
@@ -23,7 +23,7 @@ async def get_llm_response(prompt):
         return "Sorry, I'm having trouble responding right now."
 
 
-async def handle_patient_reply(audio_path):
+async def handle_patient_reply(audio_path): #The Conversation flow will start from here.
     transcript = transcribe_audio(audio_path)
     print("Patient said:", transcript)
 
@@ -65,11 +65,11 @@ Politely ask them to choose another day between Monday and Saturday.
                 invalid_prompt = f"""
 A patient requested an appointment at {time} on {date}, which is during the doctor's lunch break (2pm to 4pm).
 Inform them that the doctor is unavailable at this time.
-Suggest they pick a time between 10am–2pm or 3pm–7pm.
+Suggest they pick a time between 10am–2pm or 4pm–7pm.
 """
             else:
                 invalid_prompt = f"""
-A patient requested a time of {time} on {date}, which is outside the clinic’s working hours (10am–2pm and 3pm–7pm).
+A patient requested a time of {time} on {date}, which is outside the clinic’s working hours (10am–2pm and 4pm–7pm).
 Kindly inform them and ask for a new preferred time within working hours.
 """
             speak_invalid = await get_llm_response(invalid_prompt)
@@ -95,7 +95,7 @@ Kindly inform them and ask for a new preferred time within working hours.
 
 
 
-async def handle_email_spelling(audio_path):
+async def handle_email_spelling(audio_path): # Need to pass second audio file (mentioning patient's email.)
     spelled_email = transcribe_audio(audio_path)
     print("Spelled email (raw):", spelled_email)
 
@@ -116,12 +116,11 @@ async def confirm_email_and_book(audio_path, date, time, email):
     print("Patient confirmed:", confirmation_reply)
 
     if "yes" in confirmation_reply:
-        from calendar_utils import is_slot_available
 
         if not is_slot_available(date, time):
             suggest_prompt = f"""
 You are an AI scheduling assistant. The slot on {date} at {time} is already booked.
-Please suggest the next three available 20-minute slots between 10am–2pm or 3pm–7pm, Monday to Saturday.
+Please suggest the next three available 20-minute slots between 10am–2pm or 4pm–7pm, Monday to Saturday.
 Return them in this format:
 1. YYYY-MM-DD at HH:MM
 2. YYYY-MM-DD at HH:MM
@@ -208,7 +207,7 @@ Time: HH:MM
         if not is_valid:
             invalid_slot_prompt = f"""
 The patient selected {date} at {time}, which is invalid due to: {reason}.
-Inform the patient about the issue and politely ask them to pick a different time slot within 10am–2pm or 3pm–7pm, Monday to Saturday.
+Inform the patient about the issue and politely ask them to pick a different time slot within 10am–2pm or 4pm–7pm, Monday to Saturday.
 """
             invalid_response = await get_llm_response(invalid_slot_prompt)
             return text_to_speech(invalid_response)
@@ -277,14 +276,13 @@ async def confirm_reschedule_and_book(audio_path, old_date, old_time):
     if not is_valid:
         invalid_prompt = f"""
 The patient requested a rescheduling on {date} at {time}, which is outside the available hours or not valid.
-Inform the patient of valid hours: Monday–Saturday, 10am–2pm and 3pm–7pm, excluding 2pm–4pm lunch break.
+Inform the patient of valid hours: Monday–Saturday, 10am–2pm and 4pm–7pm, excluding 2pm–4pm lunch break.
 Ask them to choose another time.
 """
         response = await get_llm_response(invalid_prompt)
         return text_to_speech(response)
 
     # Step 6: Check if the new slot is available
-    from calendar_utils import is_slot_available
 
     if not is_slot_available(date, time):
         conflict_prompt = f"""
@@ -403,3 +401,4 @@ Time: HH:MM
         return date, time
     except Exception:
         return None, None
+    
