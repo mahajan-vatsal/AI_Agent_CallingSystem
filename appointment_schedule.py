@@ -1,10 +1,13 @@
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
-from calendar_utils import create_event, get_slot_datetime, is_valid_appointment, is_slot_available
+from calendar_utils import create_event, get_slot_datetime, is_valid_appointment, is_slot_available, cancel_event, find_upcoming_appointment_by_email, is_email_already_booked
 from email_utils import send_email
 from speech_utils import transcribe_audio, text_to_speech
 from datetime import datetime
+import re
+
+EMAIL_REGEX = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
 
 load_dotenv()
 
@@ -32,7 +35,7 @@ async def handle_patient_reply(audio_path):
 
         if not transcript.strip():
             tries += 1
-            yield None, None, None, text_to_speech("I didn't hear anything clearly. Could you please repeat your appointment request?")
+            yield None, None, None, None, text_to_speech("I didn't hear anything clearly. Could you please repeat your appointment request?")
             continue
 
         prompt_info = f"""
@@ -50,7 +53,7 @@ If any detail is unclear or missing, say: "I didn’t catch the full details. Co
 
         if "I didn’t catch" in info_response:
             tries += 1
-            yield None, None, None, text_to_speech("Sorry, I didn't catch all the details. Could you please repeat your appointment request clearly?")
+            yield None, None, None, None, text_to_speech("Sorry, I didn't catch all the details. Could you please repeat your appointment request clearly?")
             continue
 
         try:
@@ -59,7 +62,7 @@ If any detail is unclear or missing, say: "I didn’t catch the full details. Co
             time = next(line for line in info_response.splitlines() if "Time:" in line).split(":", 1)[1].strip()
         except Exception:
             tries += 1
-            yield None, None, None, text_to_speech("There was an error understanding your appointment request. Could you please repeat?")
+            yield None, None, None, None, text_to_speech("There was an error understanding your appointment request. Could you please repeat?")
             continue
 
         if intent == "schedule":
@@ -83,7 +86,7 @@ A patient requested a time of {time} on {date}, which is outside the clinic’s 
 Kindly inform them and ask for a new preferred time within working hours.
 """
                 speak_invalid = await get_llm_response(invalid_prompt)
-                yield None, None, None, text_to_speech(speak_invalid)
+                yield None, None, None, None, text_to_speech(speak_invalid)
                 tries += 1
                 continue
 
@@ -93,7 +96,7 @@ The requested slot {date} at {time} is already taken.
 Politely ask the patient to suggest another date and time.
 """
                 unavailable_response = await get_llm_response(unavailable_prompt)
-                yield None, None, None, text_to_speech(unavailable_response)
+                yield None, None, None, None, text_to_speech(unavailable_response)
                 tries += 1
                 continue
 
@@ -102,12 +105,26 @@ Now ask the patient to say their email address, spelling it letter by letter for
 Tell them to speak clearly and slowly.
 """
             ask_email_text = await get_llm_response(ask_email_prompt)
-            yield transcript, date, time, text_to_speech(ask_email_text)
+            yield intent, transcript, date, time, text_to_speech(ask_email_text)
             return
+
+        elif intent == "reschedule":
+            yield intent, transcript, date, time, text_to_speech("Rescheduling functionality is not implemented yet. Please try again later.")
+            return
+
+        elif intent == "cancel":
+            ask_email_prompt = """
+Now ask the patient to say their email address, spelling it letter by letter for clarity.
+Tell them to speak clearly and slowly.
+"""
+            ask_email_text = await get_llm_response(ask_email_prompt)
+            yield intent, transcript, date, time, text_to_speech(ask_email_text)
+            return
+
         else:
             tries += 1
-            yield None, None, None, text_to_speech("Sorry, I didn't understand your request. Could you please repeat?")
-    yield None, None, None, text_to_speech("Sorry, we couldn't understand your request. Please try calling again later.")
+            yield None, None, None, None, text_to_speech("Sorry, I didn't understand your request. Could you please repeat?")
+    yield None, None, None, None, text_to_speech("Sorry, we couldn't understand your request. Please try calling again later.")
 
 
 async def handle_email_spelling(audio_path):
@@ -135,7 +152,7 @@ Only output the email address.
 
     yield None, text_to_speech("Sorry, we couldn't capture your email correctly. Please try calling again later.")
 
-async def confirm_email_and_book(audio_path, date, time, email):
+async def confirm_email_and_book(audio_path, date, time, email, service, calendar_id):
     tries = 0
     while tries < MAX_RETRIES:
         confirmation_reply = transcribe_audio(audio_path).lower()
@@ -147,6 +164,11 @@ async def confirm_email_and_book(audio_path, date, time, email):
             continue
 
         if "yes" in confirmation_reply:
+            if not is_email_already_booked(service, calendar_id, email):
+                yield "email_already_used", text_to_speech("You already have an appointment booked with this email. Only one is allowed.")
+                return
+
+
             if not is_slot_available(date, time):
                 suggest_prompt = f"""
 The slot on {date} at {time} is already booked.
@@ -213,6 +235,91 @@ Apologize and ask the patient to slowly spell their email address again.
             yield None, text_to_speech("Sorry, I didn't understand. Please say Yes or No.")
 
     yield text_to_speech("Sorry, we couldn't confirm your appointment. Please try again later.")
+
+# Handles appointment cancellation
+async def handle_cancel_flow(email_audio_path, confirm_audio_path):
+    # Step 1: Transcribe and reconstruct email
+    spelled_email = transcribe_audio(email_audio_path)
+    print("🔤 Raw spelled email from audio:", spelled_email)
+
+    confirm_prompt = f"""
+You are an AI assistant confirming an email address.
+The patient said: "{spelled_email}". Try to reconstruct the email address.
+Only output the email address.
+"""
+    email = (await get_llm_response(confirm_prompt)).strip()
+    print("📧 Reconstructed Email:", email)
+
+    # Step 1.5: Validate email format
+    if not re.match(EMAIL_REGEX, email):
+        print("❌ Invalid email format. Asking for re-spelling.")
+        yield "repeat_email", None, None
+        return
+
+    # Step 2: Confirm reconstructed email using patient's Yes/No voice
+    confirmation_text = transcribe_audio(confirm_audio_path)
+    print("🗣️ Patient response to email confirmation:", confirmation_text)
+
+    yes_no_prompt = f"""
+You are a smart assistant. The patient responded: "{confirmation_text}".
+Did the patient confirm the email (yes or no)? Output only "yes" or "no".
+"""
+    confirmed = (await get_llm_response(yes_no_prompt)).strip().lower()
+    print("✅ Email confirmation result:", confirmed)
+
+    if "no" in confirmed:
+        yield "repeat_email", None, None
+        return
+
+    # Step 3: Proceed to cancel appointment
+    appointment = find_upcoming_appointment_by_email(email)
+    if not appointment:
+        not_found_prompt = f"""
+You are a voice assistant. No upcoming appointment was found for {email}.
+Politely inform the patient and suggest they double-check the email or book a new appointment if needed.
+"""
+        speak_text = await get_llm_response(not_found_prompt)
+        print(f"🔍 No appointment found for: {email}")
+        yield "not_found", email, text_to_speech(speak_text)
+        return
+
+    event_id = appointment['id']
+    event_start = appointment['start'].get('dateTime', '')
+    event_datetime = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+    date_str = event_datetime.strftime('%Y-%m-%d')
+    time_str = event_datetime.strftime('%H:%M')
+
+    if cancel_event(event_id):
+        # Send cancellation emails
+        cancel_patient_email = f"""
+You are an email assistant. Write a polite email to the patient at {email}, confirming that their appointment on {date_str} at {time_str} has been successfully canceled.
+Sign off with "Thank you!"
+"""
+        cancel_doctor_email = f"""
+Notify the doctor that the appointment with a patient (email: {email}) on {date_str} at {time_str} has been canceled.
+Use a professional tone. Sign off with "Regards".
+"""
+        patient_body = await get_llm_response(cancel_patient_email)
+        doctor_body = await get_llm_response(cancel_doctor_email)
+
+        send_email(email, "Your Appointment has been Canceled", patient_body)
+        send_email("vatsalmahajan0007@gmail.com", "Appointment Canceled", doctor_body)
+
+        # Speak cancellation confirmation
+        cancel_confirm_prompt = f"""
+You are a voice assistant. Inform the patient that their appointment on {date_str} at {time_str} has been canceled and a cancellation email has been sent.
+End with a polite thank-you message.
+"""
+        cancel_confirm_text = await get_llm_response(cancel_confirm_prompt)
+        print(f"📨 Appointment canceled and emails sent for: {email}")
+        yield "canceled", email, text_to_speech(cancel_confirm_text)
+    else:
+        error_prompt = f"""
+You are a voice assistant. Inform the patient that there was an error canceling their appointment.
+Kindly ask them to try again or contact the clinic directly.
+"""
+        print(f"❗ Error canceling event for: {email}")
+        yield "error", email, text_to_speech(await get_llm_response(error_prompt))
 
 
 
