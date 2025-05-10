@@ -3,137 +3,228 @@ from appointment_schedule import (
     handle_patient_reply,
     handle_email_spelling,
     confirm_email_and_book,
-    handle_cancel_flow
+    handle_cancel_flow,
+    confirm_email_and_reschedule,
+    extract_missing_date_or_time
 )
-
-from calendar_utils import get_calendar_service, CALENDAR_ID 
+from calendar_utils import get_calendar_service, CALENDAR_ID
 
 service = get_calendar_service()
 calendar_id = CALENDAR_ID
 
 async def main():
-    print("Welcome to Test Mode for Appointment Scheduler.\n")
+    print("🎧 Welcome to Test Mode for AI Appointment Scheduler.\n")
 
-    # Step 1: Get valid patient intent (schedule, reschedule, cancel)
-    while True:
-        audio_path = input("Upload or replace your patient request audio (.wav) and enter the path: ").strip()
-        result_found = False
+    intent, transcript, date, time = None, "", "", ""
 
-        async for intent, transcript, date, time, response_audio in handle_patient_reply(audio_path):
-            if intent in ["schedule", "reschedule", "cancel"]:
-                print(f"✅ Understood Intent: {intent}, Transcript: {transcript}, Date: {date}, Time: {time}")
-                result_found = True
+    while not intent:
+        audio_path = input("🔈 Upload/replace patient request audio (.wav) and enter the path: ").strip()
+
+        async for detected_intent, detected_transcript, detected_date, detected_time, response_audio in handle_patient_reply(audio_path):
+            print(f"📝 Transcript: {detected_transcript}")
+            print(f"🧠 LLM Detected → Intent: {detected_intent}, Date: {detected_date}, Time: {detected_time}")
+
+            if detected_intent in ["schedule", "reschedule", "cancel"]:
+                intent = detected_intent
+                date = detected_date
+                time = detected_time
                 break
-            else:
-                print("⚠️ LLM couldn't parse the request properly.")
-                break  # Retry with new audio_path
 
-        if result_found:
-            break
+        if not intent:
+            print("⚠️ Could not understand intent. Try again.")
 
-    # ➤ Cancel Flow
+
+    # ========== CANCEL FLOW ==========
     if intent == "cancel":
-        print("\n=== 🟡 Cancel Flow ===")
-        max_attempts = 3
-        attempts = 0
-        email_confirmed = False
+            print("\n=== ❌ Cancel Flow ===")
+            max_attempts = 3
+            attempts = 0
 
-        while attempts < max_attempts and not email_confirmed:
-            email_audio_path = input("🔤 Please provide email spelling audio path: ").strip()
-            confirm_audio_path = input("✅ Please provide confirmation audio path (yes/no): ").strip()
+            while attempts < max_attempts:
+                email_audio = input("\n🔤 Upload patient email spelling audio: ").strip()
+                email = None
 
-            async for status, returned_email, audio_response in handle_cancel_flow(email_audio_path, confirm_audio_path):
-                if audio_response:
-                    print("📢 Speaking:", audio_response)
-
-                if status == "repeat_email":
-                    attempts += 1
-                    print(f"🔁 Patient rejected email confirmation. Attempt {attempts}/{max_attempts}.")
-                    break  # Ask for new audio inputs
-
-                elif status == "not_found":
-                    print(f"❌ No appointment found for email: {returned_email}")
-                    email_confirmed = True  # Stop further attempts
-                    break
-
-                elif status == "canceled":
-                    print(f"✅ Appointment canceled for email: {returned_email}")
-                    email_confirmed = True
-                    break
-
-                elif status == "error":
-                    print(f"❗ Error occurred while canceling for: {returned_email}")
-                    email_confirmed = True
-                    break
-            else:
-                # If generator didn't yield anything (shouldn't happen)
-                print("⚠️ Unexpected end of cancellation flow.")
-                break
-
-        if attempts == max_attempts:
-            print("⛔ Max attempts reached. Cancelation flow ended.")
-        return  # Stop after cancel flow
-
-    # ➤ Schedule/Reschedule Flow
-    # Step 2: Get email from spelling
-    while True:
-        audio_path = input("\nUpload patient email spelling audio and enter the path: ").strip()
-        email_found = False
-
-        async for email, response_audio in handle_email_spelling(audio_path):
-            if email:
-                print(f"✅ Captured Email: {email}")
-                email_found = True
-                break
-            else:
-                print("⚠️ Could not extract email. Try again.")
-                break  # Retry
-
-        if email_found:
-            break
-
-    # Step 3: Confirm email and finalize booking
-    while True:
-        audio_path = input(f"\nUpload Yes/No confirmation for email '{email}': ").strip()
-        async for result, response_audio in confirm_email_and_book(audio_path, date, time, email, service, calendar_id):
-            
-            if response_audio:
-                print("📢 Speaking:", response_audio)
-
-            if result == "booked":
-                print("✅ Appointment successfully booked and confirmation emails sent!")
-                return
-            
-            elif result == "email_already_used":
-                print("⛔ Appointment already exists for this email. Cannot book another.")
-                return
-            
-            elif result == "repeat_email":
-                print("🔁 Patient said NO. Repeating email spelling process.")
-                break  # Break to redo spelling
-
-            else:
-                print("⚠️ Unclear Yes/No response. Try again.")
-                break
-
-        if result == "repeat_email":
-            while True:
-                audio_path = input("Upload corrected spelled email audio: ").strip()
-                async for email, response_audio in handle_email_spelling(audio_path):
-                    if email:
-                        print(f"✅ Captured New Email: {email}")
+                async for captured_email, _ in handle_email_spelling(email_audio):
+                    if captured_email:
+                        email = captured_email
+                        print(f"✅ Email Captured: {email}")
                         break
                     else:
                         print("⚠️ Could not extract email. Try again.")
-                        break
-                else:
-                    continue
-                break
 
-        print("\n✅ Test Session Completed.")
+                if not email:
+                    attempts += 1
+                    continue
+
+                confirm_audio = input(f"\n✅ Upload Yes/No confirmation for email '{email}': ").strip()
+
+                async for status, returned_email, audio_response in handle_cancel_flow(email_audio, confirm_audio):
+                    if audio_response:
+                        print("📢 Speaking:", audio_response)
+
+                    if status == "repeat_email":
+                        print(f"🔁 Email rejected by patient. Attempt {attempts+1}/{max_attempts}")
+                        attempts += 1
+                        break
+
+                    elif status == "not_found":
+                        print(f"❌ No appointment found for: {returned_email}")
+                        return
+
+                    elif status == "canceled":
+                        print(f"✅ Appointment canceled for: {returned_email}")
+                        return
+
+                    elif status == "error":
+                        print(f"❗ Unexpected error for: {returned_email}")
+                        return
+
+                else:
+                    print("⚠️ Unexpected issue during cancel flow.")
+                    break
+
+            print("⛔ Max attempts reached. Cancelation flow ended.")
+            return
+
+    # ========== RESCHEDULE FLOW ==========
+    if intent == "reschedule":
+            print("\n=== 🔄 Reschedule Flow ===")
+            max_attempts = 3
+            attempts = 0
+            success = False
+            if not date and not time:
+                print("🗓️ Assistant says: Please say your preferred date and time.")
+                datetime_audio = input("🎤 Upload audio with patient's response for both date and time: ").strip()
+                new_date, new_time, _ = await extract_missing_date_or_time(datetime_audio)
+                if new_date:
+                    date = new_date
+                    print(f"✅ Captured Date: {date}")
+                else:
+                    print("❌ Could not extract date.")
+                if new_time:
+                    time = new_time
+                    print(f"✅ Captured Time: {time}")
+                else:
+                    print("❌ Could not extract time.")
+            else:
+                if not date:
+                    print("🗓️ Assistant says: Please say your preferred date.")
+                    date_audio = input("🎤 Upload audio with patient's date response: ").strip()
+                    new_date, _, _ = await extract_missing_date_or_time(date_audio)
+                    if new_date:
+                        date = new_date
+                        print(f"✅ Captured Date: {date}")
+                    else:
+                        print("❌ Could not extract date.")
+
+                if not time:
+                        print("🗓️ Assistant says: Please say your preferred time.")
+                        time_audio = input("🎤 Upload audio with patient's time response: ").strip()
+                        _, new_time, _ = await extract_missing_date_or_time(time_audio)
+                        if new_time:
+                            time = new_time
+                            print(f"✅ Captured Time: {time}")
+                        else:
+                            print("❌ Could not extract time.")
+
+            print(f"\n🔁 Attempting to reschedule to {date} at {time}")
+
+            while attempts < max_attempts:
+                email_audio = input("\n🔤 Upload patient email spelling audio: ").strip()
+                email = None
+
+                async for captured_email, _ in handle_email_spelling(email_audio):
+                    if captured_email:
+                        email = captured_email
+                        print(f"✅ Email Captured: {email}")
+                        break
+                    else:
+                        print("⚠️ Could not extract email. Try again.")
+
+                if not email:
+                    attempts += 1
+                    continue
+
+                confirm_audio = input(f"\n✅ Upload Yes/No confirmation for email '{email}': ").strip()
+
+                async for result, _,  response_audio in confirm_email_and_reschedule(
+                    confirm_audio, date, time, email, service, calendar_id
+    ):
+                    if result == "reschedule_booked":
+                        print("✅ Rescheduled Successfully.")
+                        success = True
+                    elif result == "reschedule_repeat_email":
+                        print("🔁 Retrying email spelling.")
+                        attempts += 1
+                    elif result == "cancel_not_found":
+                        print("❌ No appointment found to reschedule.")
+                        break
+                    else:
+                        print("⚠️ Could not reschedule. Trying again...")
+                        attempts += 1
+                if success:
+                    break
+
+    
+
+        
+
+    # ========== SCHEDULE FLOW ==========
+    if intent == "schedule":
+            print("\n=== 📅 Schedule Flow ===")
+            max_attempts = 3
+            attempts = 0
+
+            while attempts < max_attempts:
+                email_audio = input("\n🔤 Upload patient email spelling audio: ").strip()
+                email = None
+
+                async for captured_email, _ in handle_email_spelling(email_audio):
+                    if captured_email:
+                        email = captured_email
+                        print(f"✅ Email Captured: {email}")
+                        break
+                    else:
+                        print("⚠️ Could not extract email. Try again.")
+
+                if not email:
+                    attempts += 1
+                    continue
+
+                confirm_audio = input(f"\n✅ Upload Yes/No confirmation for email '{email}': ").strip()
+
+                async for result, response_audio in confirm_email_and_book(
+                    confirm_audio, date, time, email, service, calendar_id
+        ):
+                    if response_audio:
+                        print("📢 Speaking:", response_audio)
+
+                    if result == "booked":
+                        print("✅ Appointment booked and confirmation sent!")
+                        return
+
+                    elif result == "email_already_used":
+                        print("⛔ Appointment already exists for this email.")
+                        return
+
+                    elif result == "repeat_email":
+                        print("🔁 Patient said NO. Retrying email spelling...")
+                        attempts += 1
+                        break
+
+                    else:
+                        print("⚠️ Could not understand confirmation. Try again.")
+                        attempts += 1
+                        break
+
+            print("⛔ Max attempts reached. Scheduling failed.")
+            return
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
 
 
 
@@ -183,3 +274,10 @@ if __name__ == "__main__":
 
 #I have already implemented some to cancel multiple appointments by requiring the patient to confirm both email and the specific date/time. Here's the code you can analyse. and let me know where to we need to make the changes:
 
+
+#Patient's date: Sorry, we couldn't understand your request. Please try calling again later.
+#Patient's time: Asking for E-mail address.
+#Email spelling: Please say your email address. which is correct, and as per the flow
+#Yes/No confirmation: This confirmation asking is correct, but should be asked after The model reconstructs the email address and then ask for yes or no.
+# In the above output, the loop is running such number of times? After extracting the intent the loop should be stopped and the next step if intent == 'reschedule' should be started.
+#Why the loop is not breaking after giving the confirmation?

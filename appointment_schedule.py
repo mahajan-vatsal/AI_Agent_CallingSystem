@@ -7,6 +7,14 @@ from speech_utils import transcribe_audio, text_to_speech
 from datetime import datetime
 import re
 
+from calendar_utils import get_calendar_service, CALENDAR_ID
+
+service = get_calendar_service()
+calendar_id = CALENDAR_ID
+
+# Define the doctor's email address
+DOCTOR_EMAIL = "vatsalmahajan0007@gmail.com"
+
 EMAIL_REGEX = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
 
 load_dotenv()
@@ -14,7 +22,6 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("FIREWORKS_API_KEY"), base_url="https://api.fireworks.ai/inference/v1")
 
 MAX_RETRIES = 3
-
 async def get_llm_response(prompt):
     try:
         response = client.chat.completions.create(
@@ -29,102 +36,117 @@ async def get_llm_response(prompt):
 
 async def handle_patient_reply(audio_path):
     tries = 0
-    while tries < MAX_RETRIES:
-        transcript = transcribe_audio(audio_path)
-        print("Patient said:", transcript)
+    detected_intent, detected_date, detected_time = None, "", ""
 
-        if not transcript.strip():
+    while tries < MAX_RETRIES:
+        detected_transcript = transcribe_audio(audio_path)
+        print("Patient said:", detected_transcript)
+
+        if not detected_transcript.strip():
             tries += 1
             yield None, None, None, None, text_to_speech("I didn't hear anything clearly. Could you please repeat your appointment request?")
             continue
 
         prompt_info = f"""
 You are a smart AI assistant for a doctor's clinic.
-A patient said: "{transcript}"
-Extract the intent (schedule/reschedule/cancel), date (in YYYY-MM-DD) The year always be the current year like this year 2025(make sense), and time (24-hour HH:MM).
-Return only in this format:
-Intent: schedule
-Date: 2025-04-29
-Time: 10:00
-If any detail is unclear or missing, say: "I didn’t catch the full details. Could you please repeat?"
+The patient previously said their intent was: "{detected_intent or 'none'}"
+The patient now said: "{detected_transcript}"
+
+Extract:
+- Intent: either "schedule", "reschedule", or "cancel".
+- Date: in format YYYY-MM-DD (year must be 2025).
+- Time: in 24-hour HH:MM format.
+
+If the patient didn't say a new intent, assume the previous intent ("{detected_intent or 'none'}").
+Only return output in this format:
+Intent: reschedule
+Date: 2025-05-25
+Time: 16:00
+
+If date/time not understood, leave them blank.
 """
+
         info_response = await get_llm_response(prompt_info)
         print("LLM Info Response:\n", info_response)
 
-        if "I didn’t catch" in info_response:
-            tries += 1
-            yield None, None, None, None, text_to_speech("Sorry, I didn't catch all the details. Could you please repeat your appointment request clearly?")
-            continue
+        try:
+            detected_intent = next(line for line in info_response.splitlines() if "Intent:" in line).split(":", 1)[1].strip().lower()
+        except Exception:
+            detected_intent = detected_intent or None
 
         try:
-            intent = next(line for line in info_response.splitlines() if "Intent:" in line).split(":", 1)[1].strip().lower()
-            date = next(line for line in info_response.splitlines() if "Date:" in line).split(":", 1)[1].strip()
-            time = next(line for line in info_response.splitlines() if "Time:" in line).split(":", 1)[1].strip()
+            new_date = next(line for line in info_response.splitlines() if "Date:" in line).split(":", 1)[1].strip()
+            if new_date and len(new_date) >= 8:  # Basic length check
+                detected_date = new_date
         except Exception:
-            tries += 1
-            yield None, None, None, None, text_to_speech("There was an error understanding your appointment request. Could you please repeat?")
-            continue
+            pass
 
-        if intent == "schedule":
-            is_valid, reason = is_valid_appointment(date, time)
+        try:
+            new_time = next(line for line in info_response.splitlines() if "Time:" in line).split(":", 1)[1].strip()
+            if new_time and len(new_time) >= 4:  # Basic check like 16:00
+                detected_time = new_time
+        except Exception:
+            pass
+
+
+        if detected_intent:
+            if detected_intent in ["reschedule"]:
+                if not detected_date or not detected_time:
+
+                    followup_prompt = f"""
+The patient wants to {detected_intent} an appointment.
+You heard: date = "{detected_date or 'not mentioned'}", time = "{detected_time or 'not mentioned'}".
+If anything is missing, ask ONLY for the missing part in a friendly way. Be brief.
+"""
+                    response = await get_llm_response(followup_prompt)
+                    tries += 1
+                    yield detected_intent, detected_transcript, detected_date, detected_time, text_to_speech(response)
+                    continue
+
+
+            is_valid, reason = is_valid_appointment(detected_date, detected_time)
             if not is_valid:
                 if reason == "Sunday":
-                    invalid_prompt = f"""
-A patient requested an appointment on {date}, which is a Sunday.
-Inform the patient that the clinic is closed on Sundays.
-Politely ask them to choose another day between Monday and Saturday.
-"""
+                    invalid = "The clinic is closed on Sundays. Please choose another day Monday–Saturday."
                 elif reason == "Lunch Break":
-                    invalid_prompt = f"""
-A patient requested an appointment at {time} on {date}, which is during the doctor's lunch break (2pm to 4pm).
-Inform them that the doctor is unavailable at this time.
-Suggest they pick a time between 10am–2pm or 4pm–7pm.
-"""
+                    invalid = "The doctor is unavailable 2–4 PM. Please pick a time between 10 AM–2 PM or 4 PM–7 PM."
                 else:
-                    invalid_prompt = f"""
-A patient requested a time of {time} on {date}, which is outside the clinic’s working hours (10am–2pm and 4pm–7pm).
-Kindly inform them and ask for a new preferred time within working hours.
-"""
-                speak_invalid = await get_llm_response(invalid_prompt)
-                yield None, None, None, None, text_to_speech(speak_invalid)
+                    invalid = "That time is outside our working hours (10–2 & 4–7). Please choose a valid slot."
+                speak = await get_llm_response(invalid)
                 tries += 1
+                yield None, None, None, None, text_to_speech(speak)
                 continue
 
-            if not is_slot_available(date, time):
-                unavailable_prompt = f"""
-The requested slot {date} at {time} is already taken.
-Politely ask the patient to suggest another date and time.
-"""
-                unavailable_response = await get_llm_response(unavailable_prompt)
-                yield None, None, None, None, text_to_speech(unavailable_response)
+            if not is_slot_available(detected_date, detected_time):
+                prompt = f"The slot on {detected_date} at {detected_time} is already taken. Please suggest another date and time."
+                speak = await get_llm_response(prompt)
                 tries += 1
+                yield None, None, None, None, text_to_speech(speak)
                 continue
 
+            # All good — ask for email
+            ask_email = """
+Now ask the patient to say their email address, spelling it letter by letter for clarity.
+Tell them to speak clearly and slowly.
+"""
+            email_text = await get_llm_response(ask_email)
+            yield detected_intent, detected_transcript, detected_date, detected_time, text_to_speech(email_text)
+            return
+
+        elif detected_intent == "cancel":
             ask_email_prompt = """
 Now ask the patient to say their email address, spelling it letter by letter for clarity.
 Tell them to speak clearly and slowly.
 """
             ask_email_text = await get_llm_response(ask_email_prompt)
-            yield intent, transcript, date, time, text_to_speech(ask_email_text)
-            return
-
-        elif intent == "reschedule":
-            yield intent, transcript, date, time, text_to_speech("Rescheduling functionality is not implemented yet. Please try again later.")
-            return
-
-        elif intent == "cancel":
-            ask_email_prompt = """
-Now ask the patient to say their email address, spelling it letter by letter for clarity.
-Tell them to speak clearly and slowly.
-"""
-            ask_email_text = await get_llm_response(ask_email_prompt)
-            yield intent, transcript, date, time, text_to_speech(ask_email_text)
+            yield detected_intent, detected_transcript, detected_date, detected_time, text_to_speech(ask_email_text)
             return
 
         else:
             tries += 1
-            yield None, None, None, None, text_to_speech("Sorry, I didn't understand your request. Could you please repeat?")
-    yield None, None, None, None, text_to_speech("Sorry, we couldn't understand your request. Please try calling again later.")
+            yield detected_intent, detected_transcript, detected_date, detected_time, text_to_speech("Sorry, I didn't understand your request. Could you please repeat?")
+
+    yield detected_intent, detected_transcript, detected_date, detected_time, text_to_speech("Sorry, we couldn't understand your request. Please try calling again later.")
 
 
 async def handle_email_spelling(audio_path):
@@ -164,9 +186,17 @@ async def confirm_email_and_book(audio_path, date, time, email, service, calenda
             continue
 
         if "yes" in confirmation_reply:
-            if not is_email_already_booked(service, calendar_id, email):
-                yield "email_already_used", text_to_speech("You already have an appointment booked with this email. Only one is allowed.")
+            if is_email_already_booked(service, calendar_id, email):
+                email_booked_prompt = f"""
+                The email address {email} already has an appointment booked.
+Politely inform the patient that only one appointment is allowed per email.
+Ask if they would like to reschedule.
+Mention: "If you want, we first need to cancel your previous appointment and then schedule a new one."
+"""
+                email_booked_response = await get_llm_response(email_booked_prompt)
+                yield None, None, None, None, text_to_speech(email_booked_response)
                 return
+
 
 
             if not is_slot_available(date, time):
@@ -320,6 +350,98 @@ Kindly ask them to try again or contact the clinic directly.
 """
         print(f"❗ Error canceling event for: {email}")
         yield "error", email, text_to_speech(await get_llm_response(error_prompt))
+
+async def confirm_email_and_reschedule(
+    confirm_audio_path,
+    new_date,
+    new_time,
+    email,
+    service,
+    calendar_id
+):
+    MAX_RETRIES = 3
+    tries = 0
+
+    # Step 2: Wait for Yes/No confirmation
+    while tries < MAX_RETRIES:
+        confirmation_reply = transcribe_audio(confirm_audio_path).lower()
+        print("Email confirmation reply:", confirmation_reply)
+
+        if not confirmation_reply.strip():
+            tries += 1
+            yield "reschedule_no_response", email, text_to_speech("I didn't catch your response. Please say Yes or No.")
+            continue
+
+        if "yes" in confirmation_reply:
+            # Step 3: Locate existing appointment
+            appointment = find_upcoming_appointment_by_email(email)
+            if not appointment:
+                yield "cancel_not_found", email, text_to_speech(
+                    "We couldn't find any upcoming appointment to reschedule with that email."
+                )
+                return
+
+            old_start = appointment['start']['dateTime']
+            old_date = old_start.split("T")[0]
+            old_time = old_start.split("T")[1][:5]
+
+            # Step 4: Cancel and rebook
+            cancel_event(appointment['id'])
+
+            start, end = get_slot_datetime(new_date, new_time)
+            try:
+                create_event(start, end, "Doctor Appointment", email)
+            except Exception as e:
+                print(f"Booking error: {e}")
+                yield "reschedule_error", email, text_to_speech(
+                    "We ran into an error while booking the new appointment. Please try again later."
+                )
+                return
+
+            # Step 5: Send emails
+            patient_body = (
+                f"Your appointment on {old_date} at {old_time} has been rescheduled to "
+                f"{new_date} at {new_time}. Please arrive 10 minutes early."
+            )
+            doctor_body = (
+                f"The appointment with {email} on {old_date} at {old_time} has been rescheduled to "
+                f"{new_date} at {new_time}."
+            )
+            send_email(email, "Appointment Rescheduled", patient_body)
+            send_email(DOCTOR_EMAIL, "Appointment Rescheduled", doctor_body)
+
+            yield "reschedule_booked", email, text_to_speech(
+                f"Your appointment has been successfully rescheduled to {new_date} at {new_time}. "
+                "A confirmation email has been sent."
+            )
+            return
+
+        elif "no" in confirmation_reply:
+            tries += 1
+            yield "reschedule_repeat_email", email, text_to_speech(
+                "Okay, let's try spelling your email again."
+            )
+            return
+
+        else:
+            tries += 1
+            yield "reschedule_invalid_response", email, text_to_speech("Sorry, I didn't understand. Please say Yes or No.")
+
+    # Max retries reached
+    yield "reschedule_max_attempts", email, text_to_speech(
+        "Sorry, we couldn't confirm your email. Please try again later."
+    )
+
+
+
+async def extract_missing_date_or_time(audio_path):
+    """
+    Uses LLM to extract date or time from an additional voice input.
+    """
+    async for intent, transcript, date, time, _ in handle_patient_reply(audio_path):
+        return date, time, transcript
+    return None, None, "Could not extract"
+
 
 
 
