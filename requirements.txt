@@ -9,3 +9,11 @@ requests
 google-auth-httplib2
 google-auth-oauthlib
 aiohttp
+langchain
+langgraph==0.0.41
+pydub
+faster-whisper
+pytz
+SpeechRecognition
+gtts
+#sqlite3
